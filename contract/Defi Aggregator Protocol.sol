@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
 interface IDEX {
     function swap(address tokenIn, address tokenOut, uint amountIn) external returns (uint amountOut);
     function getAmountOut(address tokenIn, address tokenOut, uint amountIn) external view returns (uint amountOut);
@@ -14,27 +18,8 @@ interface IERC20 {
     function allowance(address owner, address spender) external view returns (uint);
 }
 
-contract DeFiAggregator {
-    address public owner;
+contract DeFiAggregator is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
     bool public paused;
-    bool private locked;
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not authorized");
-        _;
-    }
-
-    modifier whenNotPaused() {
-        require(!paused, "Contract is paused");
-        _;
-    }
-
-    modifier nonReentrant() {
-        require(!locked, "Reentrancy not allowed");
-        locked = true;
-        _;
-        locked = false;
-    }
 
     event SwapExecuted(
         address indexed user,
@@ -45,12 +30,23 @@ contract DeFiAggregator {
         uint amountOut
     );
 
-    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
     event Paused();
     event Unpaused();
 
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
-        owner = msg.sender;
+        _disableInitializers(); // Disable constructor for proxy-safe upgradeable contract
+    }
+
+    function initialize() external initializer {
+        __Ownable_init();
+        __ReentrancyGuard_init();
+        paused = false;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
+        _;
     }
 
     function swapTokens(
@@ -61,14 +57,11 @@ contract DeFiAggregator {
     ) external whenNotPaused nonReentrant returns (uint) {
         require(amountIn > 0, "Amount must be greater than 0");
 
-        // Transfer tokens to this contract
         IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
         IERC20(tokenIn).approve(dex, amountIn);
 
-        // Execute swap
         uint amountOut = IDEX(dex).swap(tokenIn, tokenOut, amountIn);
 
-        // Send output tokens to user
         IERC20(tokenOut).transfer(msg.sender, amountOut);
 
         emit SwapExecuted(msg.sender, dex, tokenIn, tokenOut, amountIn, amountOut);
@@ -103,28 +96,59 @@ contract DeFiAggregator {
         return IDEX(dex).getAmountOut(tokenIn, tokenOut, amountIn);
     }
 
+    function getEstimatedBatchSwap(
+        address[] calldata dexes,
+        address[] calldata tokenIns,
+        address[] calldata tokenOuts,
+        uint[] calldata amountsIn
+    ) external view returns (uint[] memory) {
+        require(
+            dexes.length == tokenIns.length &&
+            tokenIns.length == tokenOuts.length &&
+            tokenOuts.length == amountsIn.length,
+            "Input array lengths must match"
+        );
+
+        uint[] memory estimatedOutputs = new uint[](dexes.length);
+        for (uint i = 0; i < dexes.length; i++) {
+            estimatedOutputs[i] = IDEX(dexes[i]).getAmountOut(tokenIns[i], tokenOuts[i], amountsIn[i]);
+        }
+        return estimatedOutputs;
+    }
+
     function rescueTokens(address token, uint amount) external onlyOwner {
-        IERC20(token).transfer(owner, amount);
+        IERC20(token).transfer(owner(), amount);
     }
 
     function emergencyWithdrawToken(address token) external onlyOwner {
         uint balance = IERC20(token).balanceOf(address(this));
         require(balance > 0, "No tokens to withdraw");
-        IERC20(token).transfer(owner, balance);
+        IERC20(token).transfer(owner(), balance);
     }
 
     function emergencyWithdrawETH() external onlyOwner {
-        payable(owner).transfer(address(this).balance);
+        payable(owner()).transfer(address(this).balance);
+    }
+
+    function withdrawMultipleTokens(address[] calldata tokens) external onlyOwner {
+        for (uint i = 0; i < tokens.length; i++) {
+            uint balance = IERC20(tokens[i]).balanceOf(address(this));
+            if (balance > 0) {
+                IERC20(tokens[i]).transfer(owner(), balance);
+            }
+        }
+    }
+
+    function getTokenBalance(address token) external view returns (uint) {
+        return IERC20(token).balanceOf(address(this));
     }
 
     function checkAllowance(address token, address user) external view returns (uint) {
         return IERC20(token).allowance(user, address(this));
     }
 
-    function updateOwner(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Invalid address");
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
+    function setApprovalForDEX(address token, address dex, uint amount) external onlyOwner {
+        IERC20(token).approve(dex, amount);
     }
 
     function pause() external onlyOwner {
@@ -137,9 +161,15 @@ contract DeFiAggregator {
         emit Unpaused();
     }
 
-    receive() external payable {}
+    function togglePause() external onlyOwner {
+        paused = !paused;
+        if (paused) {
+            emit Paused();
+        } else {
+            emit Unpaused();
+        }
+    }
 
+    receive() external payable {}
     fallback() external payable {}
 }
-
-
